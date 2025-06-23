@@ -1,0 +1,396 @@
+---
+title: "VIX Study"
+author: "Watson Li"
+date: "2025-06-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(TSA)
+library(tseries)
+library(forecast)
+library(plotly)
+library(vars)
+library(rsconnect)
+library(tsDyn)
+```
+
+# Data Import
+
+We start by reading in the raw CSV files for USD/JPY exchange rates, Gold futures, VIX index, and financial sentiment data. The exchange rate data was obtained from Macrotrends, whilst Gold data were obtained from Yahoo finance, the VIX data was obtained directly from CBOE, and the news sentiment data was obtained straight from the San Francisco Fed. The data were initially gathered in March 2025, with a cutoff data of 15 March. We'll use these data for our analyses and modeling, and if so inclined, we can use newer data to evaluate the models we fit. After downloading the raw data, I took a look at them in Excel and did some preliminary cleaning and sorting, though more manipulation must be done later on, which we'll see in this notebook.
+
+At this point, we have no idea how any of these series might be related or might behave; I selected these series as I thought they might be related to the VIX due to the JPY being a safe haven currency, Gold being a safe haven asset, and news sentiment data potentially being a proxy for market sentiment, which would directly influence market volatility.
+
+```{r}
+# data ranges from 01-02-1990 to 03-15-2025
+# read USDJPY.csv, GOLD.csv, and VIX.csv
+jpy <- read.csv("data/march/USDJPY.csv")
+gold <- read.csv("data/march/GOLD.csv")
+vix <- read.csv("data/march/VIX.csv")
+
+# read sentiment data
+fin_sen <- read.csv("sentiment/news_sentiment_data.csv")
+fin_sen$date <- as.Date(fin_sen$date, format = "%Y-%m-%d")
+head(fin_sen)
+
+head(vix)
+```
+
+# Adjusting the VIX Data
+
+Here, we add a 'Next.Close' column by shifting the VIX close values by one day. Originally, I did this to check for potential relationships between the various "predictors" we'll be looking at on the next day's VIX close. Ultimately, though, as I didn't find the Gold data to be usable, I settled on just using the same day values to use in a vector autoregression (VAR) model for now.
+
+```{r}
+# IMPORTANT DON'T FORGET ABOUT THIS
+# ADD COLUMN NEXT.CLOSE BY SHIFTING VALUES FROM VIX.CLOSE BY 1 DAY
+# MOVE COLUMN 5 DOWN BY 1 ROW, EXCEPT FOR THE FIRST ROW, MUTATE TO COL 6
+
+vix <- vix %>%
+  mutate(Next.Close = c(NA, vix$VIX.Close[-nrow(vix)]))
+
+head(vix)
+```
+
+# Data Cleaning and Merging
+
+Here, we're narrowing down exactly what data we need; I don't need daily highs, lows, or any other stuff for most of these data, so we'll just take the daily close values (or volumes) and dates. We'll clean the data briefly by dropping missing entries, then merge the datasets into a single dataframe for ease of use. 
+
+```{r}
+jpy <- jpy[-1, c(1, 2)]
+gold <- gold[-1, c(1, 2, 6)]
+vix <- vix[-1, c(1, 5, 6)]
+
+vix_df <- reduce(list(jpy, gold, vix), full_join, by = "Date")
+
+vix_clean <- na.omit(vix_df)
+vix_clean[,1] <- as.Date(vix_clean[,1], format = "%m/%d/%Y")
+names(vix_clean)[2] <- "USD.JPY"
+vix_clean[,4] <- as.numeric(as.character(vix_clean[,4]))
+
+# head(vix_clean)
+
+# join vix_clean and fin_sen on date
+vix_clean <- vix_clean %>%
+  left_join(fin_sen, by = c("Date" = "date"))
+
+# drop rows with missing Gold.Volume, Gold.Price, and USD.JPY
+vix_clean <- vix_clean %>%
+  filter(!is.na(Gold.Volume) & !is.na(Gold.Price) & !is.na(USD.JPY))
+
+vix_clean <- vix_clean %>%
+# sort by date, ascending
+   arrange(Date) %>%
+   mutate(Day = row_number()) # new tool for indexing
+
+# sort by day, ascending
+vix_clean <- vix_clean %>%
+  arrange(Day)
+
+head(vix_clean)
+tail(vix_clean)
+```
+
+We'll also adjust the frequency of our data, due to the following principle: a time series sampled too frequently will always resemble a random walk, whereas a time series sampled too infrequently will resemble a white noise process. In this case, the VIX data was originally sampled daily, but we can adjust it to take every 5th observation to avoid the random walk effect. If I wanted to be more meticulous, I could actually adjust it by date to get the end of each business week instead, but accounting for various statutory holidays or other days on which exceptional things happened would have been a bit of a hassle, so I've skipped over that here and instead just took every Kth observation, where K = 5 by default. 
+
+```{r}
+# FREQUENCY TWEAK, DATA WAS ORIGINALLY DAILY BUT WE CAN CHANGE THAT HERE
+k <- 5 # TAKE EVERY KTH OBSERVATION
+# BECAUSE K=1 RESEMBLED A RANDOM WALK AND WAS OF NO USE
+
+# adjust frequency in the event it resembles a random walk
+# try every kth observation
+vix_clean <- vix_clean[seq(1, nrow(vix_clean), by = k), ]
+
+# write.csv(vix_clean, "vix_clean_by_5.csv", row.names=FALSE)
+```
+
+# Exploratory Time Series Plots
+
+We'll start with some exploratory plots of each of the time series to get a sense of how they behave. At a glance, we're able to see that Gold Futures Prices and the USD-JPY exchange rate are definitely non-stationary, as they've consistently come up over the years. Perhaps differencing would help here, but for now, let's focus on the others. 
+
+```{r}
+# just look at the VIX for now
+vix_ts <- ts(vix_clean$VIX.Close)
+gold_fut_ts <- ts(vix_clean$Gold.Price)
+gold_vol_ts <- ts(vix_clean$Gold.Volume)
+sentiment_ts <- ts(vix_clean$News.Sentiment)
+exch_ts <- ts(vix_clean$USD.JPY)
+
+plot(vix_ts, main = "VIX Time Series")
+plot(diff(vix_ts), main = "VIX, 1st Difference")
+plot(gold_fut_ts, main = "Gold Futures Price")
+gold_fut_diff <- diff(gold_fut_ts)
+plot(gold_fut_diff, main = "Gold Futures Price, 1st Difference")
+plot(exch_ts, main = "USD-JPY Exchange Rate")
+abline(h = mean(exch_ts), col = 'red')
+plot(diff(exch_ts), main = "USD-JPY Exchange Rate, 1st Difference")
+summary(exch_ts)
+```
+
+# Diagnostics for Gold Futures
+
+Let's start with a peek at the time series data for Gold futures volumes. We immediately see that the data for the later observations seem to be problematic, with a lot of values dropping to zero. As a result, this data likely won't be of use alongside the VIX data we've collected. Instead, we'll look at it individually. We'll drop the problematic data so we can have a better idea of the actual behaviour of this time series. 
+
+```{r}
+plot(gold_vol_ts, main = "Gold Volume")
+# only keep the first 1200 observations
+gold_vol_ts <- gold_vol_ts[1:1200]
+plot(gold_vol_ts, main = "Gold Volume, First 1200 Observations")
+plot(diff(gold_vol_ts), main = "Gold Volume, 1st Difference")
+```
+
+We'll next take a look at the autocorrelation function (ACF), partial autocorrelation function (PACF), and extended ACF (EACF) for the Gold futures series and its first difference. This will help us understand the underlying structure of the time series and guide our ARIMA modeling.
+
+```{r}
+acf(gold_fut_ts)
+pacf(gold_fut_ts)
+eacf(gold_fut_ts)
+
+acf(gold_fut_diff)
+pacf(gold_fut_diff)
+eacf(gold_fut_diff)
+```
+
+That ACF for the base time series doesn't look so hot, but the PACF indicates that we should only really look at the behaviour at lag one. The EACF for the regular time series suggests looking more carefully at an AR(1); the differenced data suggests a different story. Despite the spikes outside of the 2 CI limit at lags 5, 10, 12, 15, etc, I'd prefer simply to look more closely at the behaviour at lag three there. However, due to the EACF for the differenced time series, perhaps it's best not to focus too much on this for the time being, and instead focus more on our main topic at hand: the VIX. Regardless, let's still fit a simple model on these data, and we can return to it later if so inclined. 
+
+# ARIMA Modeling for Gold Futures
+
+We'll fit an ARIMA model to the Gold futures series, starting with the first difference to ensure stationarity. We'll also check the residuals for normality using a QQ plot and polynomial roots to assess the stability of the model.
+
+```{r}
+gold_fut_model <- forecast::Arima(gold_fut_ts, order = c(1, 1, 0))
+summary(gold_fut_model)
+polyroot(gold_fut_model$coef)
+qqnorm(residuals(gold_fut_model), main = "Gold Futures Model Residuals QQ")
+```
+
+And there we have it: when fitting an ARI(1,1) on the regular Gold futures data, we note that the coefficient of our AR(1) term is within 2 standard errors of 0. Furthermore, our Q-Q plot is imperfect, so let's not use this for now. 
+
+# Sentiment Diagnostics
+
+We'll now do something similar for the Gold volume and news sentiment series, focusing on the latter due to the issues mentioned previously. We'll plot the time series, check for stationarity, and examine the ACF, PACF, and EACF to understand their structure.
+
+```{r}
+plot(sentiment_ts, main = "News Sentiment")
+abline(h = mean(sentiment_ts), col = 'red')
+sentiment_diff <- diff(sentiment_ts)
+plot(sentiment_diff, main = "News Sentiment, 1st Difference")
+
+acf(sentiment_diff)
+pacf(sentiment_diff)
+eacf(sentiment_diff)
+```
+
+The data for news sentiment looks surprisingly good! Perhaps this may be of use to us. From the EACF, it looks like we'd be able to try a variety of MA or ARIMA models. 
+
+# ARIMA Modeling for VIX
+
+Let's take a look at the characteristics of the raw VIX time series, including its ACF, PACF, and EACF. This will help us determine the appropriate parameters for our ARIMA model. We'll also check the stationarity of the series and visualize it.
+
+```{r}
+plot(vix_ts, main = "VIX Time Series")
+acf(vix_ts)
+eacf(vix_ts)
+pacf(vix_ts)
+```
+
+From the first plot, we're immediately able to notice that there are massive spikes in the VIX corresponding to times of major market events, such as various financial crises (the internet bubble, 2008, COVID-19, etc). The decay in the ACF suggests an AR component, as does the EACF. Looking at the PACF, we see two significant lags we should consider, with smaller peaks at lags 5 and beyond, which can be ignored. 
+
+Here, I also declare and set parameters for the ARIMA model, including the order of differencing and the AR and MA terms, which make their way into the `tsorder` vector. I also set variables for the name of the model (for plotting), as well as the number of historical observations (and forecasted values) I'd like to see in the plots I eventually make.
+
+Using the dynamics method of model fitting, I settled on usage of an ARIMA(2, 1, 1) model for the VIX time series. This was determined by examining the ACF and PACF plots, as well as the EACF. 
+
+```{r}
+p <- 2
+d <- 1
+q <- 1
+tsorder <- c(p,d,q)
+model <- paste("ARIMA(", p, ",", d, ",", q, ")", sep = "")
+hist_length <- 60
+forecast_length <- 20
+
+VIX_model <- forecast::Arima(vix_ts, order = tsorder)
+VIX_model
+polyroot(VIX_model$coef)
+qqnorm(residuals(VIX_model), main = "VIX Model Residuals QQ Plot")
+```
+
+Our roots seem to be okay, and the Q-Q plot looks good enough, though it trails off at the ends as per usual. This model may be usable. 
+
+I was also somewhat morbidly curious about what R would automatically fit to the VIX time series, so I ran the `auto.arima` function on it. I would never actually use this in practice, as I prefer to have more control over the model parameters, but it was interesting to see what R would choose.
+
+```{r}
+# check what R automatically fits to vix_ts
+auto_fit <- auto.arima(vix_ts)
+summary(auto_fit)
+polyroot(auto_fit$coef)
+qqnorm(residuals(auto_fit), main = "VIX Auto ARIMA Residuals QQ Plot")
+```
+
+Surprisingly, `auto.arima` returned an AR(2) model, which is more reasonable than I was expecting (I've had it spit out some horrible complex models when fitting COVID data in the past!). However, I'm still more comfortable with the model I fit myself. 
+
+# Forecasting VIX with ARIMA
+
+Next, I applied the ARIMA model to generate forecasts, using the forecast length from above. The plot is made using information from the same code block above (title, number of historical observations, number of predictions, etc).
+
+```{r}
+VIX_model_forecast <- forecast(VIX_model, h = forecast_length)
+last_day <- max(vix_clean$Day)
+
+forecast_df <- data.frame(
+  Day = seq(from = last_day + k, by = k, length.out = forecast_length),
+  Forecast = as.numeric(VIX_model_forecast$mean),
+  Lo95 = VIX_model_forecast$lower[,2],
+  Hi95 = VIX_model_forecast$upper[,2]
+)
+
+tail_VIX <- tail(vix_clean, hist_length)
+
+combined_plot <- plot_ly() %>%
+  add_trace(
+    data = tail_VIX,
+    x = ~Day,
+    y = ~Next.Close,
+    type = 'scatter',
+    mode = 'lines',
+    name = 'Historical VIX',
+    line = list(width = 2, color = 'blue')
+  ) %>%
+  add_trace(
+    data = forecast_df,
+    x = ~Day,
+    y = ~Forecast,
+    type = 'scatter',
+    mode = 'lines',
+    name = 'Forecast',
+    line = list(width = 2, dash = 'dash', color = 'red')
+  ) %>%
+  add_ribbons(
+    data = forecast_df,
+    x = ~Day,
+    ymin = ~Lo95,
+    ymax = ~Hi95,
+    name = "95% CI",
+    fillcolor = 'rgba(135,206,250,0.3)',
+    line = list(color = 'rgba(135,206,250,0.1)')
+  ) %>%
+  layout(
+    title = paste("VIX: Last", hist_length, "Observations &", forecast_length, "Day", model, "Forecast"),
+    xaxis = list(title = "Days Since Start"),
+    yaxis = list(title = "VIX"),
+    showlegend = TRUE
+  )
+
+combined_plot
+```
+
+# VAR Modeling with VIX and Sentiment
+
+Next, we'll fit a VAR model to see if there are any interactions between VIX and news sentiment, then make and plot forecasts similarly to what we just did with the ARIMA model.
+
+```{r}
+vix_sentiment_ts <- ts(vix_clean[, c("VIX.Close", "News.Sentiment")])
+
+var_model <- VAR(vix_sentiment_ts, lag = 2)
+summary(var_model)
+
+var_forecast <- predict(var_model, n.ahead = forecast_length)
+var_forecast_df <- data.frame(
+  Day = seq(from = last_day + k, by = k, length.out = forecast_length),
+  VIX_Forecast = as.numeric(var_forecast$fcst$VIX.Close[,1]),
+  Sentiment_Forecast = as.numeric(var_forecast$fcst$News.Sentiment[,1]),
+  VIX_Lo95 = var_forecast$fcst$VIX.Close[,2],
+  VIX_Hi95 = var_forecast$fcst$VIX.Close[,3],
+  Sentiment_Lo95 = var_forecast$fcst$News.Sentiment[,2],
+  Sentiment_Hi95 = var_forecast$fcst$News.Sentiment[,3]
+)
+
+var_combined_plot <- plot_ly() %>%
+  add_trace(
+    data = tail_VIX,
+    x = ~Day,
+    y = ~Next.Close,
+    type = 'scatter',
+    mode = 'lines',
+    name = 'Historical VIX',
+    line = list(width = 2, color = 'blue')
+  ) %>%
+  add_trace(
+    data = var_forecast_df,
+    x = ~Day,
+    y = ~VIX_Forecast,
+    type = 'scatter',
+    mode = 'lines',
+    name = 'VAR VIX Forecast',
+    line = list(width = 2, dash = 'dash', color = 'red')
+  ) %>%
+  add_trace(
+    data = var_forecast_df,
+    x = ~Day,
+    y = ~Sentiment_Forecast,
+    type = 'scatter',
+    mode = 'lines',
+    name = 'VAR Sentiment Forecast',
+    line = list(width = 2, dash = 'dash', color = 'green')
+  ) %>%
+  add_ribbons(
+    data = var_forecast_df,
+    x = ~Day,
+    ymin = ~VIX_Lo95,
+    ymax = ~VIX_Hi95,
+    name = "VAR VIX 95% CI",
+    fillcolor = 'rgba(135,206,250,0.3)',
+    line = list(color = 'rgba(135,206,250,0.1)')
+  ) %>%
+  add_ribbons(
+    data = var_forecast_df,
+    x = ~Day,
+    ymin = ~Sentiment_Lo95,
+    ymax = ~Sentiment_Hi95,
+    name = "VAR Sentiment 95% CI",
+    fillcolor = 'rgba(144,238,144,0.3)',
+    line = list(color = 'rgba(144,238,144,0.1)')
+  ) %>%
+  layout(
+    title = "VAR Model Forecasts",
+    xaxis = list(title = "Days Since Start"),
+    yaxis = list(title = "Values"),
+    showlegend = TRUE
+  )
+
+var_combined_plot
+```
+
+# Confidence Interval Comparison
+
+Finally, as a direct comparison, we'll examine the widths of the 95% confidence bands between the ARIMA and VAR model forecasts.
+
+```{r}
+arima_pred <- c(as.numeric(VIX_model_forecast$mean))
+ci_arimalo <- c(VIX_model_forecast$lower[,2])
+ci_arimahi <- c(VIX_model_forecast$upper[,2])
+ci_arima <- as.data.frame(arima_pred) %>%
+  mutate(ci_arimalo = ci_arimalo) %>%
+  mutate(ci_arimahi = ci_arimahi) %>%
+  mutate(alpha_band = arima_pred - ci_arimalo)
+ci_arima
+
+var_pred <- c(as.numeric(var_forecast$fcst$VIX.Close[,1]))
+ci_varlo <- c(var_forecast$fcst$VIX.Close[,2])
+ci_varhi <- c(var_forecast$fcst$VIX.Close[,3])
+ci_var <- as.data.frame(var_pred) %>%
+  mutate(ci_varlo = ci_varlo) %>%
+  mutate(ci_varhi = ci_varhi) %>%
+  mutate(alpha_band = var_pred - ci_varlo)
+ci_var
+```
+
+We see that while the confidence intervals generated by the VAR model start off marginally tighter than those of the ARIMA model, as the forecast length increases, the VAR model's confidence intervals widen significantly more than those of the ARIMA model, suggesting that the VAR model may be less reliable for longer-term forecasts, at least in this case.
+
+# Future plans:
+
+I intend on gathering and using the data from March 2025 to the present to evaluate the goodness of these models, which may be difficult considering the votality caused by the current political environment in the US.
+
+I'd like to try some other models in the future. I was recommended to study stochastic differential equations for continuous modeling, which I could then use to simulate discrete time steps. Upon further research, I also found that GARCH models might be useful for modeling volatility in financial time series, which could be particularly relevant to a study of the VIX. 
